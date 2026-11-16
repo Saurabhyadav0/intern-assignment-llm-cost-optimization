@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import all_articles_blob
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -32,22 +30,28 @@ def parse_resolution(text: str) -> TicketResolution:
     )
 
 
-_FEW_SHOT = """
-Example ticket resolutions (format to copy):
+# Ordered rules, first match wins. The model follows the list instead of comparing
+# five articles itself, which keeps the prompt small and the answer stable.
+POLICY = """You are ShopAssist, the Tier-1 support copilot. Pick one action and one article id.
 
-1. Unopened headphones, day 10 → {"action":"REFUND","kb_article":"returns-within-30-days"}
-2. Ebook, license shown → {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
-3. Cracked custom mug → {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
-4. Cracked stock mug, day 2 → {"action":"REPLACE","kb_article":"damage-replacement-7-days"}
-"""
+Routing rules, first match wins:
+1. product_type subscription: subscription_age_days <= 30 -> REFUND, else SEND_ARTICLE; article subscription-cooling-off.
+2. license_revealed true -> SEND_ARTICLE; article digital-license-no-refund.
+3. customized true and damage_reported true -> ESCALATE_TIER2; article custom-items-no-replace.
+4. damage_reported true, customized false, delivered_days_ago <= 7 -> REPLACE; article damage-replacement-7-days.
+5. product_type physical, opened false, delivered_days_ago <= 30 -> REFUND; article returns-within-30-days.
+6. anything else -> ESCALATE_TIER2; article returns-within-30-days.
+
+Reply with one JSON object: {"action": "...", "kb_article": "...", "customer_reply": "..."}"""
 
 
 class SupportCopilot:
-    """
-    ShopAssist Tier-1 copilot (baseline).
+    """ShopAssist Tier-1 copilot.
 
-    Given a support ticket + order snapshot, choose an action, cite the help-center
-    article, and draft the customer reply.
+    One call per ticket. Input costs 3 points a token and output costs 15, so the
+    prompt only carries the rules plus the facts the rules read, and it asks for the
+    JSON only. The original prompt asked for step by step reasoning and quoted
+    articles, which turned a 1.5k point ticket into a 9k point ticket.
     """
 
     def __init__(self, session: CostSession | None = None):
@@ -57,32 +61,17 @@ class SupportCopilot:
     def build_messages(self, ticket_id: str) -> list[ChatMessage]:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
-        thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
 
-        system = "\n\n".join(
-            [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
-            ]
-        )
+        # Compact snapshot: same fields, roughly a third of the tokens of indent=2.
+        snapshot = json.dumps(order, separators=(",", ":"), sort_keys=True)
         user = "\n\n".join(
             [
-                f"TICKET_ID: {ticket_id}",
-                f"THREAD:\n{thread}",
+                f"THREAD:\n{format_thread(ticket)}",
                 f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
             ]
         )
-        return [ChatMessage("system", system), ChatMessage("user", user)]
+        return [ChatMessage("system", POLICY), ChatMessage("user", user)]
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
-        messages = self.build_messages(ticket_id)
-        completion = self.llm.chat("handle_ticket", messages)
+        completion = self.llm.chat("handle_ticket", self.build_messages(ticket_id))
         return parse_resolution(completion)
