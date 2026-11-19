@@ -21,7 +21,10 @@ def test_pipeline_resolves_public_tickets():
         assert got.kb_article == expected.kb_article
 
 
-def test_baseline_cost_is_high():
+def test_cost_within_target():
     pipe = SupportPipeline()
-    pipe.handle_ticket(PUBLIC[0])
-    assert pipe.session.total_points() > 70_000
+    for tid in PUBLIC:
+        start = len(pipe.session.calls)
+        pipe.handle_ticket(tid)
+        points = sum(c.points() for c in pipe.session.calls[start:])
+        assert points <= 2_500, (tid, points)
